@@ -1,0 +1,1230 @@
+/*
+ * ESP32 Daly Smart BMS BLE Reader v4.0
+ * Connects to Daly Smart BMS via Bluetooth Low Energy (BLE) and reads battery data
+ * Features: BLE device scanning, automatic BMS discovery, GATT communication, JSON output
+ * BMS MAC Address: 41:18:12:01:18:9F
+ * BMS Name: DL-41181201189F
+ */
+
+#include "Arduino.h"
+#include "BLEDevice.h"
+#include "BLEUtils.h"
+#include "BLEScan.h"
+#include "BLEAdvertisedDevice.h"
+#include "BLEClient.h"
+
+// Daly BMS Configuration
+const String TARGET_BMS_MAC = "41:18:12:01:18:9F";
+const String TARGET_BMS_NAME = "DL-41181201189F";
+String discovered_bms_mac = "";
+String discovered_bms_name = "";
+bool bms_found_by_scan = false;
+
+// BLE Configuration
+BLEScan* pBLEScan;
+BLEClient* pClient;
+BLERemoteService* pRemoteService;
+BLERemoteCharacteristic* pRemoteCharacteristic;
+
+// BMS Data Structure
+struct BMSData {
+  float voltage = 0.0;           // Total voltage (V)
+  float current = 0.0;           // Current (A)
+  float soc = 0.0;               // State of charge (%)
+  uint16_t max_cell_voltage = 0; // Max cell voltage (mV)
+  uint16_t min_cell_voltage = 0; // Min cell voltage (mV)
+  uint8_t max_temp = 0;          // Max temperature (°C)
+  uint8_t min_temp = 0;          // Min temperature (°C)
+  uint16_t cycles = 0;           // Charge cycles
+  bool protection_status = false; // Protection status
+  float remaining_capacity = 0.0; // Remaining capacity (Ah)
+  float full_capacity = 0.0;     // Full capacity (Ah)
+};
+
+BMSData bmsData;
+bool connected = false;
+unsigned long lastReadTime = 0;
+unsigned long lastScanTime = 0;
+int deviceCount = 0;
+const unsigned long READ_INTERVAL = 5000; // Read every 5 seconds
+const unsigned long SCAN_INTERVAL = 30000; // Scan every 30 seconds if not connected
+
+// Response handling variables
+String lastResponse = "";
+bool responseReceived = false;
+uint8_t expectedCommand = 0;
+BLERemoteCharacteristic* pNotifyCharacteristic = nullptr;
+
+// BLE Scan Callback Class
+class MyAdvertisedDeviceCallbacks: public BLEAdvertisedDeviceCallbacks {
+  void onResult(BLEAdvertisedDevice advertisedDevice) {
+    deviceCount++;
+    
+    String deviceName = advertisedDevice.getName().c_str();
+    String deviceAddress = advertisedDevice.getAddress().toString().c_str();
+    
+    // Always show all discovered devices
+    Serial.println("Device #" + String(deviceCount) + ": " + deviceName + " [" + deviceAddress + "]");
+    Serial.println("  RSSI: " + String(advertisedDevice.getRSSI()) + " dBm");
+    
+    if (advertisedDevice.haveServiceUUID()) {
+      Serial.print("  Service UUID: ");
+      Serial.println(advertisedDevice.getServiceUUID().toString().c_str());
+    }
+    
+    // Check if this might be a Daly BMS
+    if (deviceName.indexOf("Daly") >= 0 || 
+        deviceName.indexOf("BMS") >= 0 || 
+        deviceName.indexOf("DL-") >= 0 ||
+        deviceName.indexOf("41181201189F") >= 0 ||
+        deviceAddress.equalsIgnoreCase(TARGET_BMS_MAC) ||
+        deviceName.equalsIgnoreCase(TARGET_BMS_NAME)) {
+      
+      Serial.println("*** Potential BMS device found! ***");
+      Serial.println("Name: " + deviceName);
+      Serial.println("MAC: " + deviceAddress);
+      
+      if (deviceAddress.equalsIgnoreCase(TARGET_BMS_MAC) || 
+          deviceName.equalsIgnoreCase(TARGET_BMS_NAME)) {
+        Serial.println("*** Target BMS found! ***");
+        discovered_bms_mac = deviceAddress;
+        discovered_bms_name = deviceName;
+        bms_found_by_scan = true;
+      } else if (discovered_bms_mac.length() == 0) {
+        // Store first potential BMS if target not found
+        discovered_bms_mac = deviceAddress;
+        discovered_bms_name = deviceName;
+        Serial.println("*** Stored as potential BMS ***");
+      }
+    }
+    Serial.println("---");
+  }
+};
+
+// Notification callback function
+static void notifyCallback(BLERemoteCharacteristic* pBLERemoteCharacteristic, uint8_t* pData, size_t length, bool isNotify) {
+  Serial.print("Notification received: ");
+  for (int i = 0; i < length; i++) {
+    if (pData[i] < 16) Serial.print("0");
+    Serial.print(String(pData[i], HEX));
+  }
+  Serial.println();
+  
+  // Store response for processing
+  lastResponse = "";
+  for (int i = 0; i < length; i++) {
+    if (pData[i] < 16) lastResponse += "0";
+    lastResponse += String(pData[i], HEX);
+  }
+  responseReceived = true;
+}
+
+// Function declarations
+void scanForBMS();
+void connectToBMS();
+void readBMSData();
+void readBMSDataDirect();
+void tryMultipleServices();
+bool tryService02f00000();
+bool tryServiceFFF0();
+bool tryDirectReads();
+bool tryAlternativeCommands();
+bool sendDalyCommand(BLERemoteCharacteristic* pWriteChar, uint8_t command);
+bool sendDalyCommandAndWait(BLERemoteCharacteristic* pWriteChar, uint8_t command, unsigned long timeout);
+bool sendCommandAndCheck(BLERemoteCharacteristic* pWriteChar, uint8_t* command, size_t length, const char* name);
+void readDalyResponse(uint8_t command);
+bool setupNotifications(BLERemoteCharacteristic* pNotifyChar);
+bool setupNotificationsWithDescriptor(BLERemoteCharacteristic* pNotifyChar);
+void parseDalyResponse(uint8_t command, String hexData);
+uint8_t calculateChecksum(uint8_t* data, int length);
+void parseBMSCharacteristic(String uuid, std::string value);
+void handleSerialCommands();
+void printAvailableCommands();
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  
+  Serial.println("=== ESP32 Daly BMS BLE Reader v4.0 ===");
+  Serial.println("Enhanced with JSON data output and comprehensive BMS reading");
+  Serial.println("Target BMS MAC: " + TARGET_BMS_MAC);
+  Serial.println("Target BMS Name: " + TARGET_BMS_NAME);
+  Serial.println("==========================================");
+  
+  // Initialize BLE
+  BLEDevice::init("ESP32_BMS_Reader");
+  Serial.println("BLE initialized successfully.");
+  
+  // Create BLE Scanner
+  pBLEScan = BLEDevice::getScan();
+  pBLEScan->setAdvertisedDeviceCallbacks(new MyAdvertisedDeviceCallbacks());
+  pBLEScan->setActiveScan(true); // Active scan uses more power but gets more info
+  pBLEScan->setInterval(100);
+  pBLEScan->setWindow(99);
+  
+  printAvailableCommands();
+  
+  // Start with a BLE scan
+  scanForBMS();
+}
+
+void loop() {
+  // Handle serial commands
+  handleSerialCommands();
+  
+  if (!connected) {
+    // Scan for BMS periodically if not connected
+    if (millis() - lastScanTime >= SCAN_INTERVAL) {
+      scanForBMS();
+      lastScanTime = millis();
+    }
+    
+    // Try to connect if we have a BMS MAC address
+    if (discovered_bms_mac.length() > 0) {
+      connectToBMS();
+      delay(5000);
+    }
+    return;
+  }
+  
+  // Check if it's time to read data
+  if (millis() - lastReadTime >= READ_INTERVAL) {
+    readBMSData();
+    lastReadTime = millis();
+  }
+  
+  // Check connection status
+  if (pClient && !pClient->isConnected()) {
+    Serial.println("BMS connection lost!");
+    connected = false;
+  }
+  
+  delay(100);
+}
+
+void scanForBMS() {
+  Serial.println("\n=== Scanning for BLE devices ===");
+  Serial.println("Scanning for 10 seconds...");
+  
+  deviceCount = 0;
+  
+  // Start BLE scan
+  BLEScanResults foundDevices = pBLEScan->start(10, false);
+  
+  Serial.println("=== Scan completed ===");
+  Serial.println("Total devices found: " + String(deviceCount));
+  
+  if (deviceCount == 0) {
+    Serial.println("No BLE devices discovered.");
+    Serial.println("This could mean:");
+    Serial.println("- No BLE devices in range are advertising");
+    Serial.println("- Devices are in sleep mode");
+    Serial.println("- BLE devices are not discoverable");
+  }
+  
+  if (discovered_bms_mac.length() > 0) {
+    Serial.println("BMS device to try: " + discovered_bms_name + " [" + discovered_bms_mac + "]");
+    if (bms_found_by_scan) {
+      Serial.println("Target BMS found by scan!");
+    }
+  } else {
+    Serial.println("No BMS devices found in this scan.");
+  }
+  
+  pBLEScan->clearResults(); // Delete results from BLEScan buffer
+  Serial.println("=====================================\n");
+}
+
+void connectToBMS() {
+  if (discovered_bms_mac.length() == 0) {
+    Serial.println("No BMS device to connect to.");
+    return;
+  }
+  
+  Serial.println("Connecting to BMS: " + discovered_bms_name + " [" + discovered_bms_mac + "]");
+  
+  // Create BLE client
+  pClient = BLEDevice::createClient();
+  Serial.println("BLE client created.");
+  
+  // Connect to the BLE Server
+  BLEAddress bmsAddress(discovered_bms_mac.c_str());
+  
+  Serial.println("Attempting BLE connection...");
+  if (pClient->connect(bmsAddress)) {
+    Serial.println("*** Successfully connected to BMS via BLE! ***");
+    Serial.println("Connected to: " + discovered_bms_name + " [" + discovered_bms_mac + "]");
+    
+    // List available services
+    Serial.println("Discovering services...");
+    std::map<std::string, BLERemoteService*>* services = pClient->getServices();
+    
+    Serial.println("Available services:");
+    for (auto& service : *services) {
+      Serial.println("  Service UUID: " + String(service.first.c_str()));
+      
+      // Get characteristics for this service
+      std::map<std::string, BLERemoteCharacteristic*>* characteristics = service.second->getCharacteristics();
+      for (auto& characteristic : *characteristics) {
+        Serial.println("    Characteristic UUID: " + String(characteristic.first.c_str()));
+        Serial.print("    Properties: ");
+        Serial.print(characteristic.second->canRead() ? "R" : "-");
+        Serial.print(characteristic.second->canWrite() ? "W" : "-");
+        Serial.println();
+      }
+    }
+    
+    connected = true;
+    
+  } else {
+    Serial.println("Failed to connect to BMS via BLE");
+    // Clear discovered BMS to try scanning again
+    discovered_bms_mac = "";
+    discovered_bms_name = "";
+    bms_found_by_scan = false;
+  }
+}
+
+void readBMSData() {
+  if (!connected || !pClient || !pClient->isConnected()) {
+    Serial.println("Not connected to BMS");
+    return;
+  }
+  
+  Serial.println("Reading BMS data - trying multiple approaches...");
+  
+  // Try multiple services and approaches
+  tryMultipleServices();
+}
+
+void tryMultipleServices() {
+  std::map<std::string, BLERemoteService*>* services = pClient->getServices();
+  
+  Serial.println("{");
+  Serial.println("  \"timestamp\": " + String(millis()) + ",");
+  Serial.println("  \"device\": \"" + discovered_bms_name + "\",");
+  Serial.println("  \"mac_address\": \"" + discovered_bms_mac + "\",");
+  Serial.println("  \"attempts\": {");
+  
+  bool dataFound = false;
+  
+  // Approach 1: Try 02f00000 service with proper notification setup
+  Serial.println("    \"approach_1_02f00000\": {");
+  dataFound |= tryService02f00000();
+  Serial.println("    },");
+  
+  // Approach 2: Try fff0 service
+  Serial.println("    \"approach_2_fff0\": {");
+  dataFound |= tryServiceFFF0();
+  Serial.println("    },");
+  
+  // Approach 3: Try direct characteristic reads
+  Serial.println("    \"approach_3_direct_read\": {");
+  dataFound |= tryDirectReads();
+  Serial.println("    },");
+  
+  // Approach 4: Try alternative command formats
+  Serial.println("    \"approach_4_alternative_commands\": {");
+  dataFound |= tryAlternativeCommands();
+  Serial.println("    }");
+  
+  Serial.println("  },");
+  Serial.println("  \"data_found\": " + String(dataFound ? "true" : "false") + ",");
+  
+  // Add parsed BMS values
+  Serial.println("  \"parsed_data\": {");
+  Serial.println("    \"voltage\": " + String(bmsData.voltage, 2) + ",");
+  Serial.println("    \"current\": " + String(bmsData.current, 2) + ",");
+  Serial.println("    \"power\": " + String(bmsData.voltage * bmsData.current, 2) + ",");
+  Serial.println("    \"soc\": " + String(bmsData.soc, 1) + ",");
+  Serial.println("    \"max_cell_voltage_mv\": " + String(bmsData.max_cell_voltage) + ",");
+  Serial.println("    \"min_cell_voltage_mv\": " + String(bmsData.min_cell_voltage) + ",");
+  Serial.println("    \"max_temperature_c\": " + String(bmsData.max_temp) + ",");
+  Serial.println("    \"min_temperature_c\": " + String(bmsData.min_temp) + ",");
+  Serial.println("    \"cycles\": " + String(bmsData.cycles) + ",");
+  Serial.println("    \"protection_status\": " + String(bmsData.protection_status ? "true" : "false") + ",");
+  Serial.println("    \"remaining_capacity_ah\": " + String(bmsData.remaining_capacity, 2) + ",");
+  Serial.println("    \"full_capacity_ah\": " + String(bmsData.full_capacity, 2));
+  Serial.println("  }");
+  Serial.println("}");
+}
+
+bool tryService02f00000() {
+  BLERemoteService* pBMSService = nullptr;
+  std::map<std::string, BLERemoteService*>* services = pClient->getServices();
+  
+  for (auto& service : *services) {
+    if (service.first.find("02f00000") != std::string::npos) {
+      pBMSService = service.second;
+      break;
+    }
+  }
+  
+  if (!pBMSService) {
+    Serial.println("      \"status\": \"service_not_found\"");
+    return false;
+  }
+  
+  Serial.println("      \"status\": \"service_found\",");
+  
+  // Find characteristics
+  BLERemoteCharacteristic* pWriteChar = nullptr;
+  BLERemoteCharacteristic* pNotifyChar = nullptr;
+  
+  std::map<std::string, BLERemoteCharacteristic*>* characteristics = pBMSService->getCharacteristics();
+  
+  for (auto& characteristic : *characteristics) {
+    String uuid = String(characteristic.first.c_str());
+    if (uuid.indexOf("ff01") >= 0 && characteristic.second->canWrite()) {
+      pWriteChar = characteristic.second;
+    }
+    if (uuid.indexOf("ff02") >= 0 && characteristic.second->canNotify()) {
+      pNotifyChar = characteristic.second;
+    }
+  }
+  
+  if (!pWriteChar || !pNotifyChar) {
+    Serial.println("      \"characteristics\": \"missing\"");
+    return false;
+  }
+  
+  Serial.println("      \"characteristics\": \"found\",");
+  
+  // Setup notifications with descriptor
+  if (setupNotificationsWithDescriptor(pNotifyChar)) {
+    Serial.println("      \"notifications\": \"enabled\",");
+    
+    // Try sending commands
+    Serial.println("      \"commands\": {");
+    bool success = false;
+    
+    // Try command 0x90
+    if (sendDalyCommandAndWait(pWriteChar, 0x90, 3000)) {
+      Serial.println("        \"cmd_90\": \"success\",");
+      success = true;
+    } else {
+      Serial.println("        \"cmd_90\": \"timeout\",");
+    }
+    
+    // Try command 0x96 (temperature - might be more responsive)
+    if (sendDalyCommandAndWait(pWriteChar, 0x96, 3000)) {
+      Serial.println("        \"cmd_96\": \"success\"");
+      success = true;
+    } else {
+      Serial.println("        \"cmd_96\": \"timeout\"");
+    }
+    
+    Serial.println("      }");
+    return success;
+  } else {
+    Serial.println("      \"notifications\": \"failed\"");
+    return false;
+  }
+}
+
+bool tryServiceFFF0() {
+  BLERemoteService* pService = nullptr;
+  std::map<std::string, BLERemoteService*>* services = pClient->getServices();
+  
+  for (auto& service : *services) {
+    if (service.first.find("fff0") != std::string::npos) {
+      pService = service.second;
+      break;
+    }
+  }
+  
+  if (!pService) {
+    Serial.println("      \"status\": \"service_not_found\"");
+    return false;
+  }
+  
+  Serial.println("      \"status\": \"service_found\",");
+  Serial.println("      \"data\": {");
+  
+  // Try to read all characteristics in this service
+  std::map<std::string, BLERemoteCharacteristic*>* characteristics = pService->getCharacteristics();
+  bool dataFound = false;
+  bool firstChar = true;
+  
+  for (auto& characteristic : *characteristics) {
+    if (characteristic.second->canRead()) {
+      try {
+        if (!firstChar) Serial.println(",");
+        firstChar = false;
+        
+        std::string value = characteristic.second->readValue();
+        String charUUID = String(characteristic.first.c_str());
+        
+        Serial.print("        \"" + charUUID + "\": {");
+        Serial.print("\"hex\": \"");
+        
+        for (int i = 0; i < value.length(); i++) {
+          if ((uint8_t)value[i] < 16) Serial.print("0");
+          Serial.print(String((uint8_t)value[i], HEX));
+        }
+        Serial.print("\", \"length\": " + String(value.length()) + "}");
+        
+        if (value.length() > 0) {
+          dataFound = true;
+          // Try to parse this data
+          parseBMSCharacteristic(charUUID, value);
+        }
+        
+      } catch (const std::exception& e) {
+        Serial.print("        \"" + String(characteristic.first.c_str()) + "\": {\"error\": \"read_failed\"}");
+      }
+    }
+  }
+  
+  Serial.println();
+  Serial.println("      }");
+  return dataFound;
+}
+
+bool tryDirectReads() {
+  // Try reading from all readable characteristics across all services
+  std::map<std::string, BLERemoteService*>* services = pClient->getServices();
+  bool dataFound = false;
+  bool firstService = true;
+  
+  for (auto& service : *services) {
+    std::map<std::string, BLERemoteCharacteristic*>* characteristics = service.second->getCharacteristics();
+    
+    for (auto& characteristic : *characteristics) {
+      if (characteristic.second->canRead()) {
+        try {
+          std::string value = characteristic.second->readValue();
+          if (value.length() > 0) {
+            if (!firstService) Serial.println(",");
+            firstService = false;
+            
+            String serviceUUID = String(service.first.c_str());
+            String charUUID = String(characteristic.first.c_str());
+            
+            Serial.print("        \"" + serviceUUID + "_" + charUUID + "\": \"");
+            for (int i = 0; i < value.length(); i++) {
+              if ((uint8_t)value[i] < 16) Serial.print("0");
+              Serial.print(String((uint8_t)value[i], HEX));
+            }
+            Serial.print("\"");
+            
+            dataFound = true;
+            
+            // Try to parse meaningful data
+            if (value.length() >= 4) {
+              parseBMSCharacteristic(charUUID, value);
+            }
+          }
+        } catch (const std::exception& e) {
+          // Skip failed reads
+        }
+      }
+    }
+  }
+  
+  if (!dataFound) {
+    Serial.print("        \"status\": \"no_readable_data\"");
+  }
+  
+  return dataFound;
+}
+
+bool tryAlternativeCommands() {
+  // Find any writable characteristic
+  BLERemoteCharacteristic* pWriteChar = nullptr;
+  std::map<std::string, BLERemoteService*>* services = pClient->getServices();
+  
+  for (auto& service : *services) {
+    std::map<std::string, BLERemoteCharacteristic*>* characteristics = service.second->getCharacteristics();
+    for (auto& characteristic : *characteristics) {
+      if (characteristic.second->canWrite()) {
+        pWriteChar = characteristic.second;
+        break;
+      }
+    }
+    if (pWriteChar) break;
+  }
+  
+  if (!pWriteChar) {
+    Serial.println("      \"status\": \"no_writable_characteristic\"");
+    return false;
+  }
+  
+  Serial.println("      \"status\": \"trying_alternative_formats\",");
+  Serial.println("      \"attempts\": {");
+  
+  bool success = false;
+  
+  // Try 1: Simple ping
+  uint8_t ping[] = {0x00};
+  if (sendCommandAndCheck(pWriteChar, ping, sizeof(ping), "ping")) {
+    success = true;
+  }
+  
+  // Try 2: Alternative Daly format
+  uint8_t alt_cmd[] = {0xaa, 0x80, 0x90, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xb8};
+  if (sendCommandAndCheck(pWriteChar, alt_cmd, sizeof(alt_cmd), "alt_daly")) {
+    success = true;
+  }
+  
+  // Try 3: Short command
+  uint8_t short_cmd[] = {0xa5, 0x90, 0x08, 0x00};
+  if (sendCommandAndCheck(pWriteChar, short_cmd, sizeof(short_cmd), "short_cmd")) {
+    success = true;
+  }
+  
+  Serial.println("      }");
+  return success;
+}
+
+void parseBMSCharacteristic(String uuid, std::string value) {
+  // Enhanced BMS data parsing for Daly BLE protocol
+  uint8_t* data = (uint8_t*)value.data();
+  int len = value.length();
+  
+  Serial.print(", \"parsed\": {");
+  
+  // Parse based on characteristic UUID and data patterns
+  if (uuid.indexOf("ff03") >= 0 && len >= 2) {
+    // ff03 characteristic - could be voltage/status
+    uint16_t val = (data[0] << 8) | data[1];
+    if (val > 0) {
+      // Try different interpretations
+      float voltage = val * 0.01; // 0.01V resolution
+      if (voltage >= 10.0 && voltage <= 60.0) {
+        bmsData.voltage = voltage;
+        Serial.print("\"voltage_v\": " + String(bmsData.voltage, 2));
+      } else {
+        voltage = val * 0.1; // 0.1V resolution
+        if (voltage >= 10.0 && voltage <= 60.0) {
+          bmsData.voltage = voltage;
+          Serial.print("\"voltage_v\": " + String(bmsData.voltage, 1));
+        }
+      }
+    }
+  }
+  
+  if (uuid.indexOf("ff05") >= 0 && len >= 2) {
+    // ff05 characteristic - could be current/SOC
+    uint16_t val = (data[0] << 8) | data[1];
+    if (val > 0) {
+      // Try as SOC (0-100%)
+      if (val <= 100) {
+        bmsData.soc = val;
+        Serial.print("\"soc_percent\": " + String(bmsData.soc, 0));
+      } else if (val <= 1000) {
+        bmsData.soc = val * 0.1;
+        Serial.print("\"soc_percent\": " + String(bmsData.soc, 1));
+      }
+    }
+  }
+  
+  // Parse standard BLE characteristics that might contain BMS data
+  if (uuid.indexOf("2a04") >= 0 && len >= 8) {
+    // Connection parameters characteristic - sometimes contains BMS data
+    // Format: 08000a0000009001
+    if (len >= 8) {
+      uint16_t val1 = (data[0] << 8) | data[1]; // 0x0800 = 2048
+      uint16_t val2 = (data[2] << 8) | data[3]; // 0x000a = 10
+      uint16_t val3 = (data[4] << 8) | data[5]; // 0x0000 = 0
+      uint16_t val4 = (data[6] << 8) | data[7]; // 0x9001 = 36865
+      
+      // Try interpreting as BMS data
+      if (val1 > 100 && val1 < 6000) { // Voltage in 0.01V units
+        float voltage = val1 * 0.01;
+        if (voltage >= 10.0 && voltage <= 60.0) {
+          bmsData.voltage = voltage;
+          Serial.print("\"voltage_v\": " + String(bmsData.voltage, 2));
+        }
+      }
+      
+      if (val2 <= 100) { // SOC percentage
+        bmsData.soc = val2;
+        Serial.print(", \"soc_percent\": " + String(bmsData.soc, 0));
+      }
+      
+      if (val4 > 2000 && val4 < 5000) { // Cell voltage in mV
+        bmsData.max_cell_voltage = val4;
+        bmsData.min_cell_voltage = val4;
+        Serial.print(", \"cell_voltage_mv\": " + String(val4));
+      }
+    }
+  }
+  
+  // Try to decode any multi-byte data as potential BMS values
+  if (len >= 4) {
+    for (int i = 0; i <= len - 4; i += 2) {
+      uint16_t val = (data[i] << 8) | data[i + 1];
+      
+      // Check for voltage pattern (10-60V in various units)
+      if (val >= 1000 && val <= 6000) { // 0.01V units
+        float voltage = val * 0.01;
+        if (voltage >= 10.0 && voltage <= 60.0 && bmsData.voltage == 0.0) {
+          bmsData.voltage = voltage;
+          Serial.print(", \"potential_voltage_v\": " + String(voltage, 2));
+        }
+      }
+      
+      // Check for cell voltage pattern (2.5-4.5V in mV)
+      if (val >= 2500 && val <= 4500) {
+        if (bmsData.max_cell_voltage == 0 || val > bmsData.max_cell_voltage) {
+          bmsData.max_cell_voltage = val;
+        }
+        if (bmsData.min_cell_voltage == 0 || val < bmsData.min_cell_voltage) {
+          bmsData.min_cell_voltage = val;
+        }
+        Serial.print(", \"potential_cell_mv\": " + String(val));
+      }
+      
+      // Check for SOC pattern (0-100%)
+      if (val <= 100 && bmsData.soc == 0.0) {
+        bmsData.soc = val;
+        Serial.print(", \"potential_soc\": " + String(val));
+      }
+    }
+  }
+  
+  // Check for temperature pattern
+  if (len >= 1) {
+    uint8_t temp = data[0];
+    if (temp >= 0 && temp <= 200) {
+      int8_t actualTemp = temp - 40; // Common offset
+      if (actualTemp >= -40 && actualTemp <= 85) {
+        Serial.print(", \"temperature_c\": " + String(actualTemp));
+        if (actualTemp > bmsData.max_temp) bmsData.max_temp = actualTemp;
+        if (bmsData.min_temp == 0 || actualTemp < bmsData.min_temp) {
+          bmsData.min_temp = actualTemp;
+        }
+      }
+    }
+  }
+  
+  Serial.print("}");
+}
+
+void handleSerialCommands() {
+  if (Serial.available()) {
+    String command = Serial.readStringUntil('\n');
+    command.trim();
+    command.toLowerCase();
+    
+    if (command == "help" || command == "h") {
+      printAvailableCommands();
+    } else if (command == "scan" || command == "s") {
+      scanForBMS();
+    } else if (command == "connect" || command == "c") {
+      Serial.println("Forcing connection attempt...");
+      connectToBMS();
+    } else if (command == "status" || command == "st") {
+      Serial.println("\n=== System Status ===");
+      Serial.println("Connected: " + String(connected ? "Yes" : "No"));
+      Serial.println("Target BMS MAC: " + TARGET_BMS_MAC);
+      Serial.println("Target BMS Name: " + TARGET_BMS_NAME);
+      Serial.println("Discovered BMS: " + (discovered_bms_mac.length() > 0 ? discovered_bms_name + " [" + discovered_bms_mac + "]" : "None"));
+      Serial.println("BLE Connected: " + String((pClient && pClient->isConnected()) ? "Yes" : "No"));
+      Serial.println("Uptime: " + String(millis() / 1000) + " seconds");
+      Serial.println("====================\n");
+    } else if (command == "reset" || command == "r") {
+      Serial.println("Resetting discovered BMS...");
+      discovered_bms_mac = "";
+      discovered_bms_name = "";
+      bms_found_by_scan = false;
+      connected = false;
+      if (pClient && pClient->isConnected()) {
+        pClient->disconnect();
+      }
+    } else if (command == "data" || command == "d") {
+      if (connected) {
+        readBMSData();
+      } else {
+        Serial.println("Not connected to BMS");
+      }
+    } else if (command == "services" || command == "srv") {
+      if (connected && pClient && pClient->isConnected()) {
+        Serial.println("Listing BLE services and characteristics...");
+        std::map<std::string, BLERemoteService*>* services = pClient->getServices();
+        
+        for (auto& service : *services) {
+          Serial.println("Service: " + String(service.first.c_str()));
+          
+          std::map<std::string, BLERemoteCharacteristic*>* characteristics = service.second->getCharacteristics();
+          for (auto& characteristic : *characteristics) {
+            Serial.print("  Char: " + String(characteristic.first.c_str()) + " (Props: ");
+            Serial.print(characteristic.second->canRead() ? "R" : "-");
+            Serial.print(characteristic.second->canWrite() ? "W" : "-");
+            Serial.println(")");
+          }
+        }
+      } else {
+        Serial.println("Not connected to BMS");
+      }
+    } else if (command == "json" || command == "j") {
+      if (connected) {
+        Serial.println("Reading BMS data in JSON format...");
+        readBMSData();
+      } else {
+        Serial.println("Not connected to BMS");
+      }
+    } else if (command != "") {
+      Serial.println("Unknown command: " + command);
+      Serial.println("Type 'help' for available commands");
+    }
+  }
+}
+
+void printAvailableCommands() {
+  Serial.println("\n=== Available Commands ===");
+  Serial.println("help (h)     - Show this help");
+  Serial.println("scan (s)     - Scan for BLE devices");
+  Serial.println("connect (c)  - Force connection attempt");
+  Serial.println("status (st)  - Show system status");
+  Serial.println("reset (r)    - Reset and disconnect");
+  Serial.println("data (d)     - Read BMS data in JSON format");
+  Serial.println("json (j)     - Read BMS data in JSON format");
+  Serial.println("services     - List BLE services/characteristics");
+  Serial.println("==========================\n");
+}
+
+void readBMSDataDirect() {
+  // Fallback method: read characteristics directly
+  Serial.println("Using direct characteristic reading...");
+  
+  BLERemoteService* pBMSService = nullptr;
+  std::map<std::string, BLERemoteService*>* services = pClient->getServices();
+  
+  for (auto& service : *services) {
+    if (service.first.find("02f00000") != std::string::npos) {
+      pBMSService = service.second;
+      break;
+    }
+  }
+  
+  if (!pBMSService) {
+    for (auto& service : *services) {
+      if (service.first.find("fff0") != std::string::npos) {
+        pBMSService = service.second;
+        break;
+      }
+    }
+  }
+  
+  if (!pBMSService) {
+    Serial.println("No suitable BMS service found");
+    return;
+  }
+  
+  std::map<std::string, BLERemoteCharacteristic*>* characteristics = pBMSService->getCharacteristics();
+  
+  Serial.println("{");
+  Serial.println("  \"timestamp\": " + String(millis()) + ",");
+  Serial.println("  \"device\": \"" + discovered_bms_name + "\",");
+  Serial.println("  \"mac_address\": \"" + discovered_bms_mac + "\",");
+  Serial.println("  \"direct_read\": {");
+  
+  bool firstChar = true;
+  for (auto& characteristic : *characteristics) {
+    if (characteristic.second->canRead()) {
+      String charUUID = String(characteristic.first.c_str());
+      
+      try {
+        if (!firstChar) Serial.println(",");
+        firstChar = false;
+        
+        std::string value = characteristic.second->readValue();
+        
+        Serial.print("    \"" + charUUID + "\": {");
+        Serial.print("\"raw_hex\": \"");
+        
+        for (int i = 0; i < value.length(); i++) {
+          if ((uint8_t)value[i] < 16) Serial.print("0");
+          Serial.print(String((uint8_t)value[i], HEX));
+        }
+        Serial.print("\", \"raw_bytes\": [");
+        
+        for (int i = 0; i < value.length(); i++) {
+          if (i > 0) Serial.print(", ");
+          Serial.print(String((uint8_t)value[i]));
+        }
+        Serial.print("], \"length\": " + String(value.length()));
+        
+        if (value.length() >= 4) {
+          parseBMSCharacteristic(charUUID, value);
+        }
+        
+        Serial.print("}");
+        
+      } catch (const std::exception& e) {
+        if (!firstChar) Serial.println(",");
+        firstChar = false;
+        Serial.print("    \"" + charUUID + "\": {\"error\": \"Failed to read\"}");
+      }
+    }
+  }
+  
+  Serial.println();
+  Serial.println("  }");
+  Serial.println("}");
+}
+
+bool sendDalyCommand(BLERemoteCharacteristic* pWriteChar, uint8_t command) {
+  // Format Daly BMS command according to H2.1_103E_309F specifications:
+  // Frame Header + Communication Module Address + Data ID + Data Length + Data Content + Checksum
+  // A5 80 [command] 08 00000000000000000000 [checksum]
+  uint8_t message[13];
+  message[0] = 0xA5;  // Frame Header
+  message[1] = 0x80;  // Communication Module Address (PC to BMS)
+  message[2] = command; // Data ID (Command)
+  message[3] = 0x08;  // Data Length (8 bytes)
+  
+  // Data Content (8 bytes) - all zeros for read commands
+  for (int i = 4; i < 12; i++) {
+    message[i] = 0x00;
+  }
+  
+  // Calculate checksum (sum of all bytes except checksum)
+  message[12] = calculateChecksum(message, 12);
+  
+  Serial.print("Sending Daly command 0x");
+  if (command < 16) Serial.print("0");
+  Serial.print(String(command, HEX));
+  Serial.print(": ");
+  for (int i = 0; i < 13; i++) {
+    if (message[i] < 16) Serial.print("0");
+    Serial.print(String(message[i], HEX));
+    if (i < 12) Serial.print(" ");
+  }
+  Serial.println();
+  
+  try {
+    pWriteChar->writeValue(message, 13);
+    delay(50); // Small delay to ensure command is sent
+    return true;
+  } catch (const std::exception& e) {
+    Serial.println("Failed to send command");
+    return false;
+  }
+}
+
+void readDalyResponse(uint8_t command) {
+  expectedCommand = command;
+  responseReceived = false;
+  
+  // Setup notifications if not already done
+  if (pNotifyCharacteristic && !pNotifyCharacteristic->canNotify()) {
+    if (setupNotifications(pNotifyCharacteristic)) {
+      Serial.println("Notifications enabled");
+    }
+  }
+  
+  // Wait for response with timeout
+  unsigned long startTime = millis();
+  while (!responseReceived && (millis() - startTime < 2000)) {
+    delay(10);
+  }
+  
+  if (responseReceived) {
+    parseDalyResponse(command, lastResponse);
+    responseReceived = false;
+  } else {
+    Serial.println("{\"status\": \"timeout\", \"note\": \"No response received within 2 seconds\"}");
+  }
+}
+
+bool setupNotifications(BLERemoteCharacteristic* pNotifyChar) {
+  if (!pNotifyChar) return false;
+  
+  try {
+    pNotifyChar->registerForNotify(notifyCallback);
+    return true;
+  } catch (const std::exception& e) {
+    Serial.println("Failed to setup notifications");
+    return false;
+  }
+}
+
+void parseDalyResponse(uint8_t command, String hexData) {
+  Serial.print("\"response_data\": {");
+  Serial.print("\"raw_hex\": \"" + hexData + "\", ");
+  
+  // Convert hex string to bytes
+  int dataLen = hexData.length() / 2;
+  if (dataLen < 13) {
+    Serial.print("\"error\": \"Response too short, expected 13 bytes, got " + String(dataLen) + "\"");
+    Serial.print("}");
+    return;
+  }
+  
+  uint8_t* data = new uint8_t[dataLen];
+  for (int i = 0; i < dataLen; i++) {
+    String byteStr = hexData.substring(i * 2, i * 2 + 2);
+    data[i] = strtol(byteStr.c_str(), NULL, 16);
+  }
+  
+  // Verify Daly response format: A5 40 [command] 08 [data] [checksum]
+  if (data[0] != 0xA5) {
+    Serial.print("\"error\": \"Invalid header, expected A5, got " + String(data[0], HEX) + "\"");
+    Serial.print("}");
+    delete[] data;
+    return;
+  }
+  
+  if (data[1] != 0x40) {
+    Serial.print("\"warning\": \"Unexpected address, expected 40 (BMS to PC), got " + String(data[1], HEX) + "\", ");
+  }
+  
+  if (data[2] != command) {
+    Serial.print("\"warning\": \"Command mismatch, expected " + String(command, HEX) + ", got " + String(data[2], HEX) + "\", ");
+  }
+  
+  // Parse based on command type according to Daly H2.1_103E_309F specifications
+  switch (command) {
+    case 0x90: // SOC/Voltage/Current - Most important command
+      {
+        // Data format: [voltage_high][voltage_low][current_high][current_low][soc_high][soc_low][remaining][remaining]
+        uint16_t voltage_raw = (data[4] << 8) | data[5];    // 0.1V resolution
+        uint16_t current_raw = (data[6] << 8) | data[7];    // 0.1A resolution with 30000 offset
+        uint16_t soc_raw = (data[8] << 8) | data[9];        // 0.1% resolution
+        
+        bmsData.voltage = voltage_raw * 0.1;
+        bmsData.current = (current_raw - 30000) * 0.1;  // 30000 = 0A offset
+        bmsData.soc = soc_raw * 0.1;
+        
+        Serial.print("\"voltage_v\": " + String(bmsData.voltage, 2) + ", ");
+        Serial.print("\"current_a\": " + String(bmsData.current, 2) + ", ");
+        Serial.print("\"soc_percent\": " + String(bmsData.soc, 1) + ", ");
+        Serial.print("\"power_w\": " + String(bmsData.voltage * bmsData.current, 2));
+      }
+      break;
+      
+    case 0x91: // Cell Voltage Range
+      {
+        uint16_t max_voltage = (data[4] << 8) | data[5];    // mV
+        uint8_t max_cell_num = data[6];
+        uint16_t min_voltage = (data[7] << 8) | data[8];    // mV
+        uint8_t min_cell_num = data[9];
+        
+        bmsData.max_cell_voltage = max_voltage;
+        bmsData.min_cell_voltage = min_voltage;
+        
+        Serial.print("\"max_cell_voltage_mv\": " + String(max_voltage) + ", ");
+        Serial.print("\"max_cell_number\": " + String(max_cell_num) + ", ");
+        Serial.print("\"min_cell_voltage_mv\": " + String(min_voltage) + ", ");
+        Serial.print("\"min_cell_number\": " + String(min_cell_num) + ", ");
+        Serial.print("\"voltage_difference_mv\": " + String(max_voltage - min_voltage));
+      }
+      break;
+      
+    case 0x92: // Temperature Range
+      {
+        uint8_t max_temp_raw = data[4];
+        uint8_t max_temp_sensor = data[5];
+        uint8_t min_temp_raw = data[6];
+        uint8_t min_temp_sensor = data[7];
+        
+        // Convert from Daly format (offset by 40)
+        int8_t max_temp = max_temp_raw - 40;
+        int8_t min_temp = min_temp_raw - 40;
+        
+        bmsData.max_temp = max_temp;
+        bmsData.min_temp = min_temp;
+        
+        Serial.print("\"max_temperature_c\": " + String(max_temp) + ", ");
+        Serial.print("\"max_temp_sensor\": " + String(max_temp_sensor) + ", ");
+        Serial.print("\"min_temperature_c\": " + String(min_temp) + ", ");
+        Serial.print("\"min_temp_sensor\": " + String(min_temp_sensor) + ", ");
+        Serial.print("\"temperature_difference_c\": " + String(max_temp - min_temp));
+      }
+      break;
+      
+    case 0x93: // Charge/Discharge MOS Status
+      {
+        uint8_t charge_mos = data[4];
+        uint8_t discharge_mos = data[5];
+        uint8_t bms_cycles = data[6];
+        uint32_t capacity_ah = ((uint32_t)data[7] << 24) | ((uint32_t)data[8] << 16) | ((uint32_t)data[9] << 8) | data[10];
+        
+        bmsData.protection_status = (charge_mos == 1) && (discharge_mos == 1);
+        bmsData.full_capacity = capacity_ah * 0.001; // Convert mAh to Ah
+        
+        Serial.print("\"charge_mos_enabled\": " + String(charge_mos == 1 ? "true" : "false") + ", ");
+        Serial.print("\"discharge_mos_enabled\": " + String(discharge_mos == 1 ? "true" : "false") + ", ");
+        Serial.print("\"bms_cycles\": " + String(bms_cycles) + ", ");
+        Serial.print("\"capacity_ah\": " + String(bmsData.full_capacity, 3));
+      }
+      break;
+      
+    case 0x94: // Status Information
+      {
+        uint8_t cell_count = data[4];
+        uint8_t temp_sensor_count = data[5];
+        uint8_t charger_status = data[6];
+        uint8_t load_status = data[7];
+        uint8_t dio_state = data[8];
+        uint16_t cycle_count = (data[9] << 8) | data[10];
+        
+        bmsData.cycles = cycle_count;
+        
+        Serial.print("\"cell_count\": " + String(cell_count) + ", ");
+        Serial.print("\"temp_sensor_count\": " + String(temp_sensor_count) + ", ");
+        Serial.print("\"charger_status\": " + String(charger_status == 1 ? "true" : "false") + ", ");
+        Serial.print("\"load_status\": " + String(load_status == 1 ? "true" : "false") + ", ");
+        Serial.print("\"cycles\": " + String(cycle_count) + ", ");
+        Serial.print("\"dio_state\": \"0x" + String(dio_state, HEX) + "\"");
+      }
+      break;
+      
+    case 0x95: // Cell Voltages (individual cells)
+      {
+        Serial.print("\"cell_voltages_mv\": [");
+        for (int i = 0; i < 4 && (4 + i*2 + 1) < dataLen; i++) {
+          if (i > 0) Serial.print(", ");
+          uint16_t cell_voltage = (data[4 + i*2] << 8) | data[4 + i*2 + 1];
+          Serial.print(String(cell_voltage));
+          
+          // Update min/max cell voltages
+          if (cell_voltage > 0) {
+            if (bmsData.max_cell_voltage == 0 || cell_voltage > bmsData.max_cell_voltage) {
+              bmsData.max_cell_voltage = cell_voltage;
+            }
+            if (bmsData.min_cell_voltage == 0 || cell_voltage < bmsData.min_cell_voltage) {
+              bmsData.min_cell_voltage = cell_voltage;
+            }
+          }
+        }
+        Serial.print("]");
+      }
+      break;
+      
+    case 0x96: // Temperatures
+      {
+        Serial.print("\"temperatures_c\": [");
+        for (int i = 0; i < 7 && (4 + i) < dataLen; i++) {
+          if (i > 0) Serial.print(", ");
+          int8_t temp = data[4 + i] - 40; // Daly offset
+          Serial.print(String(temp));
+          
+          // Update min/max temperatures
+          if (bmsData.max_temp == 0 || temp > bmsData.max_temp) {
+            bmsData.max_temp = temp;
+          }
+          if (bmsData.min_temp == 0 || temp < bmsData.min_temp) {
+            bmsData.min_temp = temp;
+          }
+        }
+        Serial.print("]");
+      }
+      break;
+      
+    case 0x97: // Balancing Status
+      {
+        uint16_t balancing_state = (data[4] << 8) | data[5];
+        Serial.print("\"balancing_active\": " + String(balancing_state > 0 ? "true" : "false") + ", ");
+        Serial.print("\"balancing_cells\": \"0b" + String(balancing_state, BIN) + "\"");
+      }
+      break;
+      
+    case 0x98: // Fault Status
+      {
+        uint8_t level1_alarm = data[4];
+        uint8_t level2_alarm = data[5];
+        uint16_t fault_code = (data[6] << 8) | data[7];
+        
+        Serial.print("\"level1_alarm\": \"0x" + String(level1_alarm, HEX) + "\", ");
+        Serial.print("\"level2_alarm\": \"0x" + String(level2_alarm, HEX) + "\", ");
+        Serial.print("\"fault_code\": \"0x" + String(fault_code, HEX) + "\", ");
+        Serial.print("\"fault_active\": " + String((level1_alarm > 0 || level2_alarm > 0) ? "true" : "false"));
+      }
+      break;
+      
+    default:
+      Serial.print("\"error\": \"Unknown command 0x" + String(command, HEX) + "\"");
+      break;
+  }
+  
+  // Calculate remaining capacity if we have SOC and full capacity
+  if (bmsData.soc > 0 && bmsData.full_capacity > 0) {
+    bmsData.remaining_capacity = (bmsData.soc / 100.0) * bmsData.full_capacity;
+  }
+  
+  Serial.print("}");
+  delete[] data;
+}
+
+bool sendDalyCommandAndWait(BLERemoteCharacteristic* pWriteChar, uint8_t command, unsigned long timeout) {
+  if (!sendDalyCommand(pWriteChar, command)) {
+    return false;
+  }
+  
+  responseReceived = false;
+  expectedCommand = command;
+  
+  unsigned long startTime = millis();
+  while (!responseReceived && (millis() - startTime < timeout)) {
+    delay(10);
+  }
+  
+  if (responseReceived) {
+    parseDalyResponse(command, lastResponse);
+    responseReceived = false;
+    return true;
+  }
+  
+  return false;
+}
+
+bool sendCommandAndCheck(BLERemoteCharacteristic* pWriteChar, uint8_t* command, size_t length, const char* name) {
+  Serial.print("        \"" + String(name) + "\": ");
+  
+  try {
+    pWriteChar->writeValue(command, length);
+    
+    // Wait briefly for any response
+    responseReceived = false;
+    unsigned long startTime = millis();
+    while (!responseReceived && (millis() - startTime < 1000)) {
+      delay(10);
+    }
+    
+    if (responseReceived) {
+      Serial.println("\"response_received\",");
+      responseReceived = false;
+      return true;
+    } else {
+      Serial.println("\"no_response\",");
+      return false;
+    }
+  } catch (const std::exception& e) {
+    Serial.println("\"write_failed\",");
+    return false;
+  }
+}
+
+bool setupNotificationsWithDescriptor(BLERemoteCharacteristic* pNotifyChar) {
+  if (!pNotifyChar) return false;
+  
+  try {
+    // First register for notifications
+    pNotifyChar->registerForNotify(notifyCallback);
+    
+    // Try to enable notifications via descriptor
+    BLERemoteDescriptor* pDescriptor = pNotifyChar->getDescriptor(BLEUUID((uint16_t)0x2902));
+    if (pDescriptor) {
+      uint8_t notificationOn[] = {0x01, 0x00};
+      pDescriptor->writeValue(notificationOn, 2, true);
+    }
+    
+    delay(100); // Give time for setup
+    return true;
+  } catch (const std::exception& e) {
+    Serial.println("Failed to setup notifications with descriptor");
+    return false;
+  }
+}
+
+uint8_t calculateChecksum(uint8_t* data, int length) {
+  uint8_t sum = 0;
+  for (int i = 0; i < length; i++) {
+    sum += data[i];
+  }
+  return sum;
+}
