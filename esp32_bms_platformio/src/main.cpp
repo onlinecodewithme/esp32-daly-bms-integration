@@ -329,16 +329,18 @@ void readBMSData() {
 }
 
 void tryMultipleServices() {
-  Serial.println("{");
-  Serial.println("  \"timestamp\": " + String(millis()) + ",");
-  Serial.println("  \"device\": \"" + discovered_bms_name + "\",");
-  Serial.println("  \"mac_address\": \"" + discovered_bms_mac + "\",");
-  Serial.println("  \"daly_protocol\": {");
+  // ROS2 Contract: JSON output with BMS_DATA prefix for easy parsing
+  Serial.print("BMS_DATA:");
+  Serial.print("{");
+  Serial.print("\"timestamp\":" + String(millis()) + ",");
+  Serial.print("\"device\":\"" + discovered_bms_name + "\",");
+  Serial.print("\"mac_address\":\"" + discovered_bms_mac + "\",");
+  Serial.print("\"daly_protocol\":{");
   
   bool dataFound = tryProperDalyProtocol();
   
-  Serial.println("  },");
-  Serial.println("  \"data_found\": " + String(dataFound ? "true" : "false"));
+  Serial.print("},");
+  Serial.print("\"data_found\":" + String(dataFound ? "true" : "false"));
   Serial.println("}");
 }
 
@@ -378,7 +380,7 @@ bool tryProperDalyProtocol() {
   }
   
   if (!pService) {
-    Serial.println("      \"status\": \"fff0_service_not_found\"");
+    Serial.print("\"status\":\"fff0_service_not_found\"");
     return false;
   }
   
@@ -387,11 +389,11 @@ bool tryProperDalyProtocol() {
   BLERemoteCharacteristic* pTxChar = pService->getCharacteristic(BLEUUID("fff2"));
   
   if (!pRxChar || !pTxChar) {
-    Serial.println("      \"status\": \"required_characteristics_not_found\"");
+    Serial.print("\"status\":\"required_characteristics_not_found\"");
     return false;
   }
   
-  Serial.println("      \"status\": \"characteristics_found\",");
+  Serial.print("\"status\":\"characteristics_found\",");
   
   // Setup notifications on RX characteristic
   if (pRxChar->canNotify()) {
@@ -402,26 +404,15 @@ bool tryProperDalyProtocol() {
     if (pDescriptor) {
       uint8_t notificationOn[] = {0x01, 0x00};
       pDescriptor->writeValue(notificationOn, 2, true);
-      Serial.println("      \"notifications\": \"enabled\",");
     }
   }
   
   bool success = false;
   
-  // Send main info command (CMD_INFO) using proper Daly protocol
-  Serial.println("      \"commands\": {");
-  Serial.println("        \"main_info\": {");
-  
   // Prepare command: HEAD_READ + CMD_INFO
   uint8_t command[8];
   memcpy(command, HEAD_READ, 2);
   memcpy(command + 2, CMD_INFO, 6);
-  
-  Serial.print("          \"command_sent\": \"");
-  for (int i = 0; i < 8; i++) {
-    Serial.printf("%02X", command[i]);
-  }
-  Serial.println("\",");
   
   try {
     // Send command
@@ -435,9 +426,6 @@ bool tryProperDalyProtocol() {
     }
     
     if (responseReceived) {
-      Serial.println("          \"response_received\": true,");
-      Serial.println("          \"response_data\": \"" + lastResponse + "\"");
-      
       // Parse the response using corrected Daly protocol logic
       if (lastResponse.length() >= 16) {
         // Convert hex string to bytes for parsing
@@ -450,18 +438,10 @@ bool tryProperDalyProtocol() {
         
         // Validate response format (expect 129 bytes total)
         if (dataLen == 129 && data[0] == 0xD2 && data[1] == 0x03) {
-          Serial.println(",");
-          Serial.println("          \"parsed_data\": {");
-          
-          // Header information
-          Serial.println("            \"header\": {");
-          Serial.printf("              \"startByte\": \"0x%02X\",\n", data[0]);
-          Serial.printf("              \"commandId\": \"0x%02X\",\n", data[1]);
-          Serial.printf("              \"dataLength\": %d\n", data[2]);
-          Serial.println("            },");
+          Serial.print("\"parsed_data\":{");
           
           // Parse cell voltages (bytes 3-35) - 16 cells, 2 bytes each
-          Serial.println("            \"cellVoltages\": [");
+          Serial.print("\"cellVoltages\":[");
           float packVoltage = 0.0;
           uint16_t maxCellVoltage = 0;
           uint16_t minCellVoltage = 65535;
@@ -475,17 +455,16 @@ bool tryProperDalyProtocol() {
             if (cellVoltageRaw > maxCellVoltage) maxCellVoltage = cellVoltageRaw;
             if (cellVoltageRaw < minCellVoltage) minCellVoltage = cellVoltageRaw;
             
-            Serial.printf("              {\"cellNumber\": %d, \"voltage\": %.3f}", i + 1, cellVoltage);
-            if (i < 15) Serial.println(",");
-            else Serial.println();
+            Serial.printf("{\"cellNumber\":%d,\"voltage\":%.3f}", i + 1, cellVoltage);
+            if (i < 15) Serial.print(",");
           }
-          Serial.println("            ],");
+          Serial.print("],");
           
           // Pack voltage (calculated from cells)
-          Serial.printf("            \"packVoltage\": %.3f,\n", packVoltage);
+          Serial.printf("\"packVoltage\":%.3f,", packVoltage);
           
-          // Current (0.0A when idle, as per your JS logic)
-          Serial.println("            \"current\": 0.0,");
+          // Current (0.0A when idle)
+          Serial.print("\"current\":0.0,");
           
           // Parse SOC (value 904 at bytes 87-88 = 90.4%)
           uint16_t socRaw = readUInt16BE(data, 87);
@@ -497,38 +476,38 @@ bool tryProperDalyProtocol() {
           } else {
             soc = socRaw;
           }
-          Serial.printf("            \"soc\": %.1f,\n", soc);
+          Serial.printf("\"soc\":%.1f,", soc);
           
           // Calculate remaining and total capacity
-          float totalCapacity = 230.0; // From your JS logic
+          float totalCapacity = 230.0;
           float remainingCapacity = (totalCapacity * soc) / 100.0;
-          Serial.printf("            \"remainingCapacity\": %.1f,\n", remainingCapacity);
-          Serial.printf("            \"totalCapacity\": %.0f,\n", totalCapacity);
+          Serial.printf("\"remainingCapacity\":%.1f,", remainingCapacity);
+          Serial.printf("\"totalCapacity\":%.0f,", totalCapacity);
           
           // Parse cycles (value 1 found at byte 106)
           uint16_t cycles = data[106];
-          Serial.printf("            \"cycles\": %d,\n", cycles);
+          Serial.printf("\"cycles\":%d,", cycles);
           
           // Parse temperatures
-          Serial.println("            \"temperatures\": [");
+          Serial.print("\"temperatures\":[");
           bool tempFound = false;
           
           // T1 and T2 at bytes 68 and 70 (value 70 = 30°C with +40 offset)
           if (data[68] == 70) {
-            Serial.println("              {\"sensor\": \"T1\", \"temperature\": 30}");
+            Serial.print("{\"sensor\":\"T1\",\"temperature\":30}");
             tempFound = true;
           }
           if (data[70] == 70) {
-            if (tempFound) Serial.println(",");
-            Serial.println("              {\"sensor\": \"T2\", \"temperature\": 30}");
+            if (tempFound) Serial.print(",");
+            Serial.print("{\"sensor\":\"T2\",\"temperature\":30}");
             tempFound = true;
           }
           
           // Look for MOS temperature (33°C = 73 with offset)
           for (int i = 72; i < 85; i++) {
             if (data[i] == 73) {
-              if (tempFound) Serial.println(",");
-              Serial.println("              {\"sensor\": \"MOS\", \"temperature\": 33}");
+              if (tempFound) Serial.print(",");
+              Serial.print("{\"sensor\":\"MOS\",\"temperature\":33}");
               tempFound = true;
               break;
             }
@@ -540,7 +519,7 @@ bool tryProperDalyProtocol() {
               if (data[i] >= 40 && data[i] <= 120) {
                 int temp = data[i] - 40;
                 if (temp >= 0 && temp <= 80) {
-                  Serial.printf("              {\"sensor\": \"T%d\", \"temperature\": %d}", (i-60)/2 + 1, temp);
+                  Serial.printf("{\"sensor\":\"T%d\",\"temperature\":%d}", (i-60)/2 + 1, temp);
                   tempFound = true;
                   break;
                 }
@@ -548,26 +527,23 @@ bool tryProperDalyProtocol() {
             }
           }
           
-          Serial.println();
-          Serial.println("            ],");
+          Serial.print("],");
           
           // MOS Status (assuming normal operation)
-          Serial.println("            \"mosStatus\": {");
-          Serial.println("              \"chargingMos\": true,");
-          Serial.println("              \"dischargingMos\": true,");
-          Serial.println("              \"balancing\": false");
-          Serial.println("            },");
+          Serial.print("\"mosStatus\":{");
+          Serial.print("\"chargingMos\":true,");
+          Serial.print("\"dischargingMos\":true,");
+          Serial.print("\"balancing\":false");
+          Serial.print("},");
           
           // Checksum
           uint16_t checksum = readUInt16BE(data, 127);
-          Serial.printf("            \"checksum\": \"0x%04X\",\n", checksum);
+          Serial.printf("\"checksum\":\"0x%04X\",", checksum);
           
           // Timestamp
-          Serial.print("            \"timestamp\": \"");
-          Serial.print(millis());
-          Serial.println("\"");
+          Serial.printf("\"timestamp\":\"%lu\"", millis());
           
-          Serial.println("          }");
+          Serial.print("}");
           
           // Update global BMS data structure
           bmsData.voltage = packVoltage;
@@ -581,10 +557,7 @@ bool tryProperDalyProtocol() {
           
           success = true;
         } else {
-          Serial.println(",");
-          Serial.printf("          \"error\": \"invalid_format_or_length\",\n");
-          Serial.printf("          \"expected_length\": 129,\n");
-          Serial.printf("          \"actual_length\": %d\n", dataLen);
+          Serial.printf("\"error\":\"invalid_format_or_length\",\"expected_length\":129,\"actual_length\":%d", dataLen);
         }
         
         delete[] data;
@@ -592,14 +565,11 @@ bool tryProperDalyProtocol() {
       
       responseReceived = false;
     } else {
-      Serial.println("          \"response_received\": false");
+      Serial.print("\"response_received\":false");
     }
   } catch (const std::exception& e) {
-    Serial.println("          \"error\": \"command_send_failed\"");
+    Serial.print("\"error\":\"command_send_failed\"");
   }
-  
-  Serial.println("        }");
-  Serial.println("      }");
   
   return success;
 }

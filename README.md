@@ -142,6 +142,298 @@ The system outputs detailed JSON-formatted data every 5 seconds when connected:
 }
 ```
 
+## ROS2 Integration
+
+### Serial Output Contract
+
+The ESP32 outputs BMS data in a standardized format for easy ROS2 integration:
+
+```
+BMS_DATA:{"timestamp":190583,"device":"DL-41181201189F","mac_address":"41:18:12:01:18:9f","daly_protocol":{"status":"characteristics_found","parsed_data":{"cellVoltages":[{"cellNumber":1,"voltage":3.318}...],"packVoltage":53.085,"current":0.0,"soc":90.4,"remainingCapacity":207.9,"totalCapacity":230,"cycles":1,"temperatures":[{"sensor":"T1","temperature":30}],"mosStatus":{"chargingMos":true,"dischargingMos":true,"balancing":false},"checksum":"0xE81F","timestamp":"190583"}},"data_found":true}
+```
+
+**Key Features:**
+- **Prefix**: `BMS_DATA:` for easy parsing
+- **Compact JSON**: Single-line format for efficient serial communication
+- **Complete Data**: All BMS parameters in one message
+- **Consistent Format**: Fixed structure for reliable parsing
+- **5-second Interval**: Regular updates for real-time monitoring
+
+### ROS2 Node Setup
+
+#### 1. Create ROS2 Package
+
+```bash
+# On your Jetson
+cd ~/ros2_ws/src
+ros2 pkg create --build-type ament_python daly_bms_reader --dependencies rclpy std_msgs sensor_msgs
+```
+
+#### 2. Create BMS Reader Node
+
+Create `~/ros2_ws/src/daly_bms_reader/daly_bms_reader/bms_reader_node.py`:
+
+```python
+#!/usr/bin/env python3
+
+import rclpy
+from rclpy.node import Node
+from sensor_msgs.msg import BatteryState
+from std_msgs.msg import Float32MultiArray, Float32
+import serial
+import json
+import threading
+
+class DalyBMSReader(Node):
+    def __init__(self):
+        super().__init__('daly_bms_reader')
+        
+        # Parameters
+        self.declare_parameter('serial_port', '/dev/ttyUSB2')
+        self.declare_parameter('baud_rate', 115200)
+        self.declare_parameter('publish_rate', 1.0)
+        
+        # Get parameters
+        self.serial_port = self.get_parameter('serial_port').value
+        self.baud_rate = self.get_parameter('baud_rate').value
+        
+        # Publishers
+        self.battery_pub = self.create_publisher(BatteryState, 'battery_state', 10)
+        self.cell_voltages_pub = self.create_publisher(Float32MultiArray, 'cell_voltages', 10)
+        self.pack_voltage_pub = self.create_publisher(Float32, 'pack_voltage', 10)
+        self.current_pub = self.create_publisher(Float32, 'current', 10)
+        self.soc_pub = self.create_publisher(Float32, 'soc', 10)
+        self.temperature_pub = self.create_publisher(Float32, 'temperature', 10)
+        
+        # Serial connection
+        try:
+            self.serial_conn = serial.Serial(self.serial_port, self.baud_rate, timeout=1)
+            self.get_logger().info(f'Connected to ESP32 on {self.serial_port}')
+        except Exception as e:
+            self.get_logger().error(f'Failed to connect to ESP32: {e}')
+            return
+        
+        # Start reading thread
+        self.reading_thread = threading.Thread(target=self.read_serial_data)
+        self.reading_thread.daemon = True
+        self.reading_thread.start()
+        
+        self.get_logger().info('Daly BMS Reader Node started')
+    
+    def read_serial_data(self):
+        while rclpy.ok():
+            try:
+                line = self.serial_conn.readline().decode('utf-8').strip()
+                if line.startswith('BMS_DATA:'):
+                    json_data = line[9:]  # Remove 'BMS_DATA:' prefix
+                    self.process_bms_data(json_data)
+            except Exception as e:
+                self.get_logger().warn(f'Serial read error: {e}')
+    
+    def process_bms_data(self, json_data):
+        try:
+            data = json.loads(json_data)
+            
+            if not data.get('data_found', False):
+                return
+            
+            parsed_data = data['daly_protocol']['parsed_data']
+            
+            # Create BatteryState message
+            battery_msg = BatteryState()
+            battery_msg.header.stamp = self.get_clock().now().to_msg()
+            battery_msg.header.frame_id = 'battery'
+            
+            # Fill battery data
+            battery_msg.voltage = float(parsed_data['packVoltage'])
+            battery_msg.current = float(parsed_data['current'])
+            battery_msg.charge = float(parsed_data['remainingCapacity'])
+            battery_msg.capacity = float(parsed_data['totalCapacity'])
+            battery_msg.percentage = float(parsed_data['soc']) / 100.0
+            battery_msg.power_supply_status = BatteryState.POWER_SUPPLY_STATUS_DISCHARGING
+            battery_msg.power_supply_health = BatteryState.POWER_SUPPLY_HEALTH_GOOD
+            battery_msg.power_supply_technology = BatteryState.POWER_SUPPLY_TECHNOLOGY_LIPO
+            
+            # Cell voltages
+            cell_voltages = [cell['voltage'] for cell in parsed_data['cellVoltages']]
+            battery_msg.cell_voltage = cell_voltages
+            
+            # Temperature (average of available sensors)
+            if parsed_data['temperatures']:
+                avg_temp = sum(t['temperature'] for t in parsed_data['temperatures']) / len(parsed_data['temperatures'])
+                battery_msg.temperature = float(avg_temp)
+            
+            # Publish messages
+            self.battery_pub.publish(battery_msg)
+            
+            # Individual topic publications
+            cell_msg = Float32MultiArray()
+            cell_msg.data = cell_voltages
+            self.cell_voltages_pub.publish(cell_msg)
+            
+            self.pack_voltage_pub.publish(Float32(data=battery_msg.voltage))
+            self.current_pub.publish(Float32(data=battery_msg.current))
+            self.soc_pub.publish(Float32(data=parsed_data['soc']))
+            
+            if parsed_data['temperatures']:
+                self.temperature_pub.publish(Float32(data=avg_temp))
+            
+            self.get_logger().info(f'Published BMS data: {battery_msg.voltage:.2f}V, {battery_msg.current:.2f}A, {parsed_data["soc"]:.1f}%')
+            
+        except Exception as e:
+            self.get_logger().error(f'Error processing BMS data: {e}')
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = DalyBMSReader()
+    
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+if __name__ == '__main__':
+    main()
+```
+
+#### 3. Setup Package Configuration
+
+Update `~/ros2_ws/src/daly_bms_reader/setup.py`:
+
+```python
+from setuptools import setup
+
+package_name = 'daly_bms_reader'
+
+setup(
+    name=package_name,
+    version='1.0.0',
+    packages=[package_name],
+    data_files=[
+        ('share/ament_index/resource_index/packages',
+            ['resource/' + package_name]),
+        ('share/' + package_name, ['package.xml']),
+        ('share/' + package_name + '/launch', ['launch/bms_reader.launch.py']),
+    ],
+    install_requires=['setuptools'],
+    zip_safe=True,
+    maintainer='your_name',
+    maintainer_email='your_email@example.com',
+    description='Daly BMS Reader for ROS2',
+    license='MIT',
+    tests_require=['pytest'],
+    entry_points={
+        'console_scripts': [
+            'bms_reader_node = daly_bms_reader.bms_reader_node:main',
+        ],
+    },
+)
+```
+
+#### 4. Create Launch File
+
+Create `~/ros2_ws/src/daly_bms_reader/launch/bms_reader.launch.py`:
+
+```python
+from launch import LaunchDescription
+from launch_ros.actions import Node
+
+def generate_launch_description():
+    return LaunchDescription([
+        Node(
+            package='daly_bms_reader',
+            executable='bms_reader_node',
+            name='daly_bms_reader',
+            parameters=[
+                {'serial_port': '/dev/ttyUSB2'},
+                {'baud_rate': 115200},
+                {'publish_rate': 1.0}
+            ],
+            output='screen'
+        )
+    ])
+```
+
+#### 5. Build and Run
+
+```bash
+# Install dependencies
+sudo apt install python3-serial
+
+# Build the package
+cd ~/ros2_ws
+colcon build --packages-select daly_bms_reader
+
+# Source the workspace
+source install/setup.bash
+
+# Run the node
+ros2 launch daly_bms_reader bms_reader.launch.py
+
+# Or run directly
+ros2 run daly_bms_reader bms_reader_node
+```
+
+#### 6. Monitor Topics
+
+```bash
+# View battery state
+ros2 topic echo /battery_state
+
+# View cell voltages
+ros2 topic echo /cell_voltages
+
+# View pack voltage
+ros2 topic echo /pack_voltage
+
+# View current
+ros2 topic echo /current
+
+# View SOC
+ros2 topic echo /soc
+
+# List all topics
+ros2 topic list
+```
+
+### ROS2 Message Types
+
+The node publishes the following topics:
+
+| Topic | Message Type | Description |
+|-------|-------------|-------------|
+| `/battery_state` | `sensor_msgs/BatteryState` | Complete battery information |
+| `/cell_voltages` | `std_msgs/Float32MultiArray` | Individual cell voltages |
+| `/pack_voltage` | `std_msgs/Float32` | Total pack voltage |
+| `/current` | `std_msgs/Float32` | Pack current |
+| `/soc` | `std_msgs/Float32` | State of charge (%) |
+| `/temperature` | `std_msgs/Float32` | Average temperature |
+
+### Hardware Connection
+
+1. **Connect ESP32 to Jetson via USB**:
+   - Use USB cable to connect ESP32 to Jetson
+   - ESP32 will appear as `/dev/ttyUSB2` (or similar)
+   - Check with: `ls /dev/ttyUSB*`
+
+2. **Verify Connection**:
+   ```bash
+   # Check if ESP32 is detected
+   dmesg | grep ttyUSB
+   
+   # Test serial communication
+   cat /dev/ttyUSB2
+   ```
+
+3. **Set Permissions** (if needed):
+   ```bash
+   sudo usermod -a -G dialout $USER
+   # Logout and login again
+   ```
+
 ## Configuration
 
 ### BMS Settings
