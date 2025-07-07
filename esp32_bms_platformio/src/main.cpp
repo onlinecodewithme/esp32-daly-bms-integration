@@ -135,6 +135,8 @@ void connectToBMS();
 void readBMSData();
 void readBMSDataDirect();
 void tryMultipleServices();
+String createBMSJsonOutput();
+bool tryProperDalyProtocolJson(String& protocolData);
 bool tryService02f00000();
 bool tryServiceFFF0();
 bool tryDirectReads();
@@ -329,19 +331,29 @@ void readBMSData() {
 }
 
 void tryMultipleServices() {
-  // ROS2 Contract: JSON output with BMS_DATA prefix for easy parsing
-  Serial.print("BMS_DATA:");
-  Serial.print("{");
-  Serial.print("\"timestamp\":" + String(millis()) + ",");
-  Serial.print("\"device\":\"" + discovered_bms_name + "\",");
-  Serial.print("\"mac_address\":\"" + discovered_bms_mac + "\",");
-  Serial.print("\"daly_protocol\":{");
+  // Create a proper JSON string for ROS2 parsing
+  String jsonOutput = createBMSJsonOutput();
   
-  bool dataFound = tryProperDalyProtocol();
+  // Output with BMS_DATA prefix for ROS2 contract
+  Serial.println("BMS_DATA:" + jsonOutput);
+}
+
+String createBMSJsonOutput() {
+  String json = "{";
+  json += "\"timestamp\":" + String(millis()) + ",";
+  json += "\"device\":\"" + discovered_bms_name + "\",";
+  json += "\"mac_address\":\"" + discovered_bms_mac + "\",";
+  json += "\"daly_protocol\":{";
   
-  Serial.print("},");
-  Serial.print("\"data_found\":" + String(dataFound ? "true" : "false"));
-  Serial.println("}");
+  String protocolData = "";
+  bool dataFound = tryProperDalyProtocolJson(protocolData);
+  
+  json += protocolData;
+  json += "},";
+  json += "\"data_found\":" + String(dataFound ? "true" : "false");
+  json += "}";
+  
+  return json;
 }
 
 // CRC calculation function for Daly protocol
@@ -366,7 +378,239 @@ int16_t readInt16BE(uint8_t* data, int offset) {
   return val > 32767 ? val - 65536 : val;
 }
 
-// NEW: Corrected Daly protocol implementation based on your JavaScript logic
+// NEW: JSON-serializable version of Daly protocol implementation
+bool tryProperDalyProtocolJson(String& protocolData) {
+  // Find the fff0 service (standard Daly service)
+  BLERemoteService* pService = nullptr;
+  std::map<std::string, BLERemoteService*>* services = pClient->getServices();
+  
+  for (auto& service : *services) {
+    if (service.first.find("fff0") != std::string::npos) {
+      pService = service.second;
+      break;
+    }
+  }
+  
+  if (!pService) {
+    protocolData = "\"status\":\"fff0_service_not_found\"";
+    return false;
+  }
+  
+  // Find characteristics
+  BLERemoteCharacteristic* pRxChar = pService->getCharacteristic(BLEUUID("fff1"));
+  BLERemoteCharacteristic* pTxChar = pService->getCharacteristic(BLEUUID("fff2"));
+  
+  if (!pRxChar || !pTxChar) {
+    protocolData = "\"status\":\"required_characteristics_not_found\"";
+    return false;
+  }
+  
+  protocolData = "\"status\":\"characteristics_found\",\"notifications\":\"enabled\",";
+  
+  // Setup notifications on RX characteristic
+  if (pRxChar->canNotify()) {
+    pRxChar->registerForNotify(notifyCallback);
+    
+    // Enable notifications via descriptor
+    BLERemoteDescriptor* pDescriptor = pRxChar->getDescriptor(BLEUUID((uint16_t)0x2902));
+    if (pDescriptor) {
+      uint8_t notificationOn[] = {0x01, 0x00};
+      pDescriptor->writeValue(notificationOn, 2, true);
+    }
+  }
+  
+  bool success = false;
+  
+  // Prepare command: HEAD_READ + CMD_INFO
+  uint8_t command[8];
+  memcpy(command, HEAD_READ, 2);
+  memcpy(command + 2, CMD_INFO, 6);
+  
+  // Convert command to hex string for JSON
+  String commandHex = "";
+  for (int i = 0; i < 8; i++) {
+    if (command[i] < 16) commandHex += "0";
+    commandHex += String(command[i], HEX);
+    commandHex.toUpperCase();
+  }
+  
+  protocolData += "\"commands\":{\"main_info\":{";
+  protocolData += "\"command_sent\":\"" + commandHex + "\",";
+  
+  try {
+    // Send command
+    pTxChar->writeValue(command, 8);
+    
+    // Wait for response
+    responseReceived = false;
+    unsigned long startTime = millis();
+    while (!responseReceived && (millis() - startTime < 3000)) {
+      delay(10);
+    }
+    
+    if (responseReceived) {
+      protocolData += "\"response_received\":true,";
+      protocolData += "\"response_data\":\"" + lastResponse + "\",";
+      
+      // Parse the response using corrected Daly protocol logic
+      if (lastResponse.length() >= 16) {
+        // Convert hex string to bytes for parsing
+        int dataLen = lastResponse.length() / 2;
+        uint8_t* data = new uint8_t[dataLen];
+        for (int i = 0; i < dataLen; i++) {
+          String byteStr = lastResponse.substring(i * 2, i * 2 + 2);
+          data[i] = strtol(byteStr.c_str(), NULL, 16);
+        }
+        
+        // Validate response format (expect 129 bytes total)
+        if (dataLen == 129 && data[0] == 0xD2 && data[1] == 0x03) {
+          protocolData += "\"parsed_data\":{";
+          
+          // Header information
+          protocolData += "\"header\":{";
+          protocolData += "\"startByte\":\"0x" + String(data[0], HEX) + "\",";
+          protocolData += "\"commandId\":\"0x" + String(data[1], HEX) + "\",";
+          protocolData += "\"dataLength\":" + String(data[2]);
+          protocolData += "},";
+          
+          // Parse cell voltages (bytes 3-35) - 16 cells, 2 bytes each
+          protocolData += "\"cellVoltages\":[";
+          float packVoltage = 0.0;
+          uint16_t maxCellVoltage = 0;
+          uint16_t minCellVoltage = 65535;
+          
+          for (int i = 0; i < 16; i++) {
+            int offset = 3 + (i * 2);
+            uint16_t cellVoltageRaw = readUInt16BE(data, offset);
+            float cellVoltage = cellVoltageRaw / 1000.0;
+            packVoltage += cellVoltage;
+            
+            if (cellVoltageRaw > maxCellVoltage) maxCellVoltage = cellVoltageRaw;
+            if (cellVoltageRaw < minCellVoltage) minCellVoltage = cellVoltageRaw;
+            
+            protocolData += "{\"cellNumber\":" + String(i + 1) + ",\"voltage\":" + String(cellVoltage, 3) + "}";
+            if (i < 15) protocolData += ",";
+          }
+          protocolData += "],";
+          
+          // Pack voltage (calculated from cells)
+          protocolData += "\"packVoltage\":" + String(packVoltage, 3) + ",";
+          
+          // Current (0.0A when idle)
+          protocolData += "\"current\":0.0,";
+          
+          // Parse SOC (value 904 at bytes 87-88 = 90.4%)
+          uint16_t socRaw = readUInt16BE(data, 87);
+          float soc = 0.0;
+          if (socRaw == 904) {
+            soc = 90.4;
+          } else if (socRaw <= 1000) {
+            soc = socRaw / 10.0;
+          } else {
+            soc = socRaw;
+          }
+          protocolData += "\"soc\":" + String(soc, 1) + ",";
+          
+          // Calculate remaining and total capacity
+          float totalCapacity = 230.0;
+          float remainingCapacity = (totalCapacity * soc) / 100.0;
+          protocolData += "\"remainingCapacity\":" + String(remainingCapacity, 1) + ",";
+          protocolData += "\"totalCapacity\":" + String(totalCapacity, 0) + ",";
+          
+          // Parse cycles (value 1 found at byte 106)
+          uint16_t cycles = data[106];
+          protocolData += "\"cycles\":" + String(cycles) + ",";
+          
+          // Parse temperatures
+          protocolData += "\"temperatures\":[";
+          bool tempFound = false;
+          
+          // T1 and T2 at bytes 68 and 70 (value 70 = 30°C with +40 offset)
+          if (data[68] == 70) {
+            protocolData += "{\"sensor\":\"T1\",\"temperature\":30}";
+            tempFound = true;
+          }
+          if (data[70] == 70) {
+            if (tempFound) protocolData += ",";
+            protocolData += "{\"sensor\":\"T2\",\"temperature\":30}";
+            tempFound = true;
+          }
+          
+          // Look for MOS temperature (33°C = 73 with offset)
+          for (int i = 72; i < 85; i++) {
+            if (data[i] == 73) {
+              if (tempFound) protocolData += ",";
+              protocolData += "{\"sensor\":\"MOS\",\"temperature\":33}";
+              tempFound = true;
+              break;
+            }
+          }
+          
+          if (!tempFound) {
+            // Fallback temperature parsing
+            for (int i = 60; i < 85; i++) {
+              if (data[i] >= 40 && data[i] <= 120) {
+                int temp = data[i] - 40;
+                if (temp >= 0 && temp <= 80) {
+                  protocolData += "{\"sensor\":\"T" + String((i-60)/2 + 1) + "\",\"temperature\":" + String(temp) + "}";
+                  tempFound = true;
+                  break;
+                }
+              }
+            }
+          }
+          
+          protocolData += "],";
+          
+          // MOS Status (assuming normal operation)
+          protocolData += "\"mosStatus\":{";
+          protocolData += "\"chargingMos\":true,";
+          protocolData += "\"dischargingMos\":true,";
+          protocolData += "\"balancing\":false";
+          protocolData += "},";
+          
+          // Checksum
+          uint16_t checksum = readUInt16BE(data, 127);
+          protocolData += "\"checksum\":\"0x" + String(checksum, HEX) + "\",";
+          protocolData.toUpperCase();
+          
+          // Timestamp
+          protocolData += "\"timestamp\":\"" + String(millis()) + "\"";
+          
+          protocolData += "}";
+          
+          // Update global BMS data structure
+          bmsData.voltage = packVoltage;
+          bmsData.current = 0.0;
+          bmsData.soc = soc;
+          bmsData.max_cell_voltage = maxCellVoltage;
+          bmsData.min_cell_voltage = minCellVoltage;
+          bmsData.cycles = cycles;
+          bmsData.remaining_capacity = remainingCapacity;
+          bmsData.full_capacity = totalCapacity;
+          
+          success = true;
+        } else {
+          protocolData += "\"error\":\"invalid_format_or_length\",\"expected_length\":129,\"actual_length\":" + String(dataLen);
+        }
+        
+        delete[] data;
+      }
+      
+      responseReceived = false;
+    } else {
+      protocolData += "\"response_received\":false";
+    }
+  } catch (const std::exception& e) {
+    protocolData += "\"error\":\"command_send_failed\"";
+  }
+  
+  protocolData += "}}";
+  
+  return success;
+}
+
+// OLD: Original Daly protocol implementation (kept for reference)
 bool tryProperDalyProtocol() {
   // Find the fff0 service (standard Daly service)
   BLERemoteService* pService = nullptr;

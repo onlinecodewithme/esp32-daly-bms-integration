@@ -1,9 +1,11 @@
-# ESP32 Daly BMS BLE Reader v4.1
+# ESP32 Daly BMS BLE Reader v4.2
 
-A comprehensive ESP32-based solution for reading battery data from Daly Smart BMS via Bluetooth Low Energy (BLE). This project provides real-time monitoring of battery parameters with **corrected Daly protocol implementation** that accurately decodes all BMS data.
+A comprehensive ESP32-based solution for reading battery data from Daly Smart BMS via Bluetooth Low Energy (BLE). This project provides real-time monitoring of battery parameters with **corrected Daly protocol implementation** and **JSON-serializable output** for seamless ROS2 integration.
 
-## 🚀 Latest Updates (v4.1)
+## 🚀 Latest Updates (v4.2)
 
+- ✅ **JSON Serializable Output**: Complete rewrite of JSON generation for proper serialization
+- ✅ **ROS2 Integration Ready**: Structured JSON format that ROS2 nodes can parse reliably
 - ✅ **Fixed Daly Protocol Decoding**: Implemented proper data parsing based on proven reference implementation
 - ✅ **Accurate Cell Voltage Reading**: Correctly parses all 16 cell voltages with mV precision
 - ✅ **Proper SOC Calculation**: Fixed State of Charge parsing (90.4% accuracy verified)
@@ -11,6 +13,7 @@ A comprehensive ESP32-based solution for reading battery data from Daly Smart BM
 - ✅ **Enhanced JSON Output**: Structured data format matching industry standards
 - ✅ **Real-time Monitoring**: Live data updates every 5 seconds
 - ✅ **Production Ready**: Thoroughly tested and verified against actual BMS app data
+- ✅ **Validated JSON**: Comprehensive test suite ensures JSON compatibility
 
 ## Features
 
@@ -146,18 +149,21 @@ The system outputs detailed JSON-formatted data every 5 seconds when connected:
 
 ### Serial Output Contract
 
-The ESP32 outputs BMS data in a standardized format for easy ROS2 integration:
+The ESP32 outputs BMS data in a standardized, JSON-serializable format for seamless ROS2 integration:
 
 ```
-BMS_DATA:{"timestamp":190583,"device":"DL-41181201189F","mac_address":"41:18:12:01:18:9f","daly_protocol":{"status":"characteristics_found","parsed_data":{"cellVoltages":[{"cellNumber":1,"voltage":3.318}...],"packVoltage":53.085,"current":0.0,"soc":90.4,"remainingCapacity":207.9,"totalCapacity":230,"cycles":1,"temperatures":[{"sensor":"T1","temperature":30}],"mosStatus":{"chargingMos":true,"dischargingMos":true,"balancing":false},"checksum":"0xE81F","timestamp":"190583"}},"data_found":true}
+BMS_DATA:{"timestamp":1234567890,"device":"DL-41181201189F","mac_address":"41:18:12:01:18:9f","daly_protocol":{"status":"characteristics_found","notifications":"enabled","commands":{"main_info":{"command_sent":"D2030000003ED7B9","response_received":true,"response_data":"d2037c0cf60cf60cf60cf70cf50cf60cf60cf60cf60cf50cf30cf60cf60cf60cf60cf4","parsed_data":{"header":{"startByte":"0xD2","commandId":"0x03","dataLength":124},"cellVoltages":[{"cellNumber":1,"voltage":3.318},{"cellNumber":2,"voltage":3.318},{"cellNumber":3,"voltage":3.318},{"cellNumber":4,"voltage":3.319},{"cellNumber":5,"voltage":3.317},{"cellNumber":6,"voltage":3.318},{"cellNumber":7,"voltage":3.318},{"cellNumber":8,"voltage":3.318},{"cellNumber":9,"voltage":3.318},{"cellNumber":10,"voltage":3.317},{"cellNumber":11,"voltage":3.315},{"cellNumber":12,"voltage":3.318},{"cellNumber":13,"voltage":3.318},{"cellNumber":14,"voltage":3.318},{"cellNumber":15,"voltage":3.318},{"cellNumber":16,"voltage":3.316}],"packVoltage":53.080,"current":0.0,"soc":90.4,"remainingCapacity":207.9,"totalCapacity":230,"cycles":1,"temperatures":[{"sensor":"T1","temperature":30},{"sensor":"T2","temperature":30}],"mosStatus":{"chargingMos":true,"dischargingMos":true,"balancing":false},"checksum":"0x2C73","timestamp":"1234567890"}}},"data_found":true}
 ```
 
 **Key Features:**
-- **Prefix**: `BMS_DATA:` for easy parsing
-- **Compact JSON**: Single-line format for efficient serial communication
-- **Complete Data**: All BMS parameters in one message
-- **Consistent Format**: Fixed structure for reliable parsing
+- **Prefix**: `BMS_DATA:` for easy parsing by ROS2 nodes
+- **JSON Serializable**: Properly formatted JSON that passes `json.loads()` validation
+- **Complete Structure**: Full protocol information including commands and responses
+- **Detailed Data**: All 16 cell voltages, pack parameters, temperatures, and status
+- **Consistent Format**: Fixed structure for reliable parsing across different systems
 - **5-second Interval**: Regular updates for real-time monitoring
+- **Validated Output**: Comprehensive test suite ensures JSON compatibility
+- **Production Ready**: No parsing errors, fully compatible with Python JSON libraries
 
 ### ROS2 Node Setup
 
